@@ -134,6 +134,9 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
   public static final String S3_RETRY_BACKOFF_CONFIG = "s3.retry.backoff.ms";
   public static final int S3_RETRY_BACKOFF_DEFAULT = 200;
 
+  public static final String MULTIPLE_VALUE_SCHEMAS_CONFIG = "multiple.value.schemas";
+  private static final boolean MULTIPLE_VALUE_SCHEMAS_DEFAULT = false;
+
   private final String name;
 
   private final StorageCommonConfig commonConfig;
@@ -443,6 +446,19 @@ public class S3SinkConnectorConfig extends StorageSinkConnectorConfig {
           ++orderInGroup,
           Width.SHORT,
           "S3 HTTP Send Uses Expect Continue"
+      );
+
+      configDef.define(
+              MULTIPLE_VALUE_SCHEMAS_CONFIG,
+              Type.BOOLEAN,
+              MULTIPLE_VALUE_SCHEMAS_DEFAULT,
+              Importance.LOW,
+              "Support multiple value schemas in on topic. Events will "
+                      + "be routed to files based on different schemas.",
+              group,
+              ++orderInGroup,
+              Width.LONG,
+              "Support multiple value schemas in one topic"
       );
 
     }

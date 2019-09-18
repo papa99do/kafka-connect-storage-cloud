@@ -48,6 +48,8 @@ import io.confluent.connect.storage.partitioner.TimestampExtractor;
 import io.confluent.connect.storage.schema.StorageSchemaCompatibility;
 import io.confluent.connect.storage.util.DateTimeUtils;
 
+import static io.confluent.connect.storage.hive.HiveConfig.SCHEMA_COMPATIBILITY_CONFIG;
+
 public class TopicPartitionWriter {
   private static final Logger log = LoggerFactory.getLogger(TopicPartitionWriter.class);
 
@@ -83,6 +85,7 @@ public class TopicPartitionWriter {
   private final Time time;
   private DateTimeZone timeZone;
   private final S3SinkConnectorConfig connectorConfig;
+  private final boolean supportMultipleValueSchema;
   private static final Time SYSTEM_TIME = new SystemTime();
 
   @Deprecated
@@ -138,7 +141,7 @@ public class TopicPartitionWriter {
     }
     timeoutMs = connectorConfig.getLong(S3SinkConnectorConfig.RETRY_BACKOFF_CONFIG);
     compatibility = StorageSchemaCompatibility.getCompatibility(
-        connectorConfig.getString(StorageSinkConnectorConfig.SCHEMA_COMPATIBILITY_CONFIG));
+        connectorConfig.getString(SCHEMA_COMPATIBILITY_CONFIG));
 
     buffer = new LinkedList<>();
     commitFiles = new HashMap<>();
@@ -157,6 +160,9 @@ public class TopicPartitionWriter {
 
     // Initialize scheduled rotation timer if applicable
     setNextScheduledRotation();
+
+    supportMultipleValueSchema = connectorConfig.getBoolean(
+            S3SinkConnectorConfig.MULTIPLE_VALUE_SCHEMAS_CONFIG);
   }
 
   private enum State {
@@ -210,9 +216,10 @@ public class TopicPartitionWriter {
         }
         Schema valueSchema = record.valueSchema();
         String encodedPartition = partitioner.encodePartition(record, now);
-        Schema currentValueSchema = currentSchemas.get(encodedPartition);
+        String valueSchemaAwareKey = getValueSchemaAwareKey(record, encodedPartition);
+        Schema currentValueSchema = currentSchemas.get(valueSchemaAwareKey);
         if (currentValueSchema == null) {
-          currentSchemas.put(encodedPartition, valueSchema);
+          currentSchemas.put(valueSchemaAwareKey, valueSchema);
           currentValueSchema = valueSchema;
         }
 
@@ -259,7 +266,7 @@ public class TopicPartitionWriter {
           encodedPartition,
           currentOffset
       );
-      currentSchemas.put(encodedPartition, valueSchema);
+      currentSchemas.put(getValueSchemaAwareKey(record, encodedPartition), valueSchema);
       nextState();
     } else if (rotateOnTime(encodedPartition, currentTimestamp, now)) {
       setNextScheduledRotation();
@@ -426,29 +433,38 @@ public class TopicPartitionWriter {
 
   private RecordWriter getWriter(SinkRecord record, String encodedPartition)
       throws ConnectException {
-    if (writers.containsKey(encodedPartition)) {
-      return writers.get(encodedPartition);
+    String valueSchemaAwareKey = getValueSchemaAwareKey(record, encodedPartition);
+    if (writers.containsKey(valueSchemaAwareKey)) {
+      return writers.get(valueSchemaAwareKey);
     }
-    String commitFilename = getCommitFilename(encodedPartition);
+    String commitFilename = getCommitFilename(record, encodedPartition);
     log.debug(
         "Creating new writer encodedPartition='{}' filename='{}'",
         encodedPartition,
         commitFilename
     );
     RecordWriter writer = writerProvider.getRecordWriter(connectorConfig, commitFilename);
-    writers.put(encodedPartition, writer);
+    writers.put(valueSchemaAwareKey, writer);
     return writer;
   }
 
-  private String getCommitFilename(String encodedPartition) {
+  private String getValueSchemaAwareKey(SinkRecord record, String encodedPartition) {
+    if (supportMultipleValueSchema && record.valueSchema() != null) {
+      return encodedPartition + "_" + record.valueSchema().name();
+    }
+    return encodedPartition;
+  }
+
+  private String getCommitFilename(SinkRecord record, String encodedPartition) {
+    String valueSchemaAwareKey = getValueSchemaAwareKey(record, encodedPartition);
     String commitFile;
-    if (commitFiles.containsKey(encodedPartition)) {
-      commitFile = commitFiles.get(encodedPartition);
+    if (commitFiles.containsKey(valueSchemaAwareKey)) {
+      commitFile = commitFiles.get(valueSchemaAwareKey);
     } else {
-      long startOffset = startOffsets.get(encodedPartition);
+      long startOffset = startOffsets.get(valueSchemaAwareKey);
       String prefix = getDirectoryPrefix(encodedPartition);
-      commitFile = fileKeyToCommit(prefix, startOffset);
-      commitFiles.put(encodedPartition, commitFile);
+      commitFile = fileKeyToCommit(prefix, startOffset, record);
+      commitFiles.put(valueSchemaAwareKey, commitFile);
     }
     return commitFile;
   }
@@ -460,26 +476,31 @@ public class TopicPartitionWriter {
            : suffix;
   }
 
-  private String fileKeyToCommit(String dirPrefix, long startOffset) {
-    String name = tp.topic()
-                      + fileDelim
-                      + tp.partition()
-                      + fileDelim
-                      + String.format(zeroPadOffsetFormat, startOffset)
-                      + extension;
-    return fileKey(topicsDir, dirPrefix, name);
+  private String fileKeyToCommit(String dirPrefix, long startOffset, SinkRecord record) {
+    StringBuilder nameBuilder = new StringBuilder(tp.topic());
+    if (supportMultipleValueSchema && record.valueSchema() != null) {
+      nameBuilder.append('_').append(record.valueSchema().name());
+    }
+    nameBuilder.append(fileDelim)
+            .append(tp.partition())
+            .append(fileDelim)
+            .append(String.format(zeroPadOffsetFormat, startOffset))
+            .append(extension);
+
+    return fileKey(topicsDir, dirPrefix, nameBuilder.toString());
   }
 
   private void writeRecord(SinkRecord record) {
     currentOffset = record.kafkaOffset();
+    String valueSchemaAwareKey = getValueSchemaAwareKey(record, currentEncodedPartition);
 
-    if (!startOffsets.containsKey(currentEncodedPartition)) {
+    if (!startOffsets.containsKey(valueSchemaAwareKey)) {
       log.trace(
           "Setting writer's start offset for '{}' to {}",
-          currentEncodedPartition,
+          valueSchemaAwareKey,
           currentOffset
       );
-      startOffsets.put(currentEncodedPartition, currentOffset);
+      startOffsets.put(valueSchemaAwareKey, currentOffset);
     }
 
     RecordWriter writer = getWriter(record, currentEncodedPartition);
@@ -500,21 +521,21 @@ public class TopicPartitionWriter {
     log.info("Files committed to S3. Target commit offset for {} is {}", tp, offsetToCommit);
   }
 
-  private void commitFile(String encodedPartition) {
-    if (!startOffsets.containsKey(encodedPartition)) {
+  private void commitFile(String valueSchemaAwareKey) {
+    if (!startOffsets.containsKey(valueSchemaAwareKey)) {
       log.warn("Tried to commit file with missing starting offset partition: {}. Ignoring.");
       return;
     }
 
-    if (writers.containsKey(encodedPartition)) {
-      RecordWriter writer = writers.get(encodedPartition);
+    if (writers.containsKey(valueSchemaAwareKey)) {
+      RecordWriter writer = writers.get(valueSchemaAwareKey);
       // Commits the file and closes the underlying output stream.
       writer.commit();
-      writers.remove(encodedPartition);
-      log.debug("Removed writer for '{}'", encodedPartition);
+      writers.remove(valueSchemaAwareKey);
+      log.debug("Removed writer for '{}'", valueSchemaAwareKey);
     }
 
-    startOffsets.remove(encodedPartition);
+    startOffsets.remove(valueSchemaAwareKey);
   }
 
   private void setRetryTimeout(long timeoutMs) {
